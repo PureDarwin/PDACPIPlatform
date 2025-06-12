@@ -48,12 +48,14 @@
 #include <pexpert/i386/boot.h>
 
 /* for some reason Xcode has disabled any and all forms of auto completion. */
+/* ZORMEISTER: Consider using CLion or VS Code with C++ extensions for better completion */
 
 extern "C" void *AcpiOsExtMapMemory(ACPI_PHYSICAL_ADDRESS, ACPI_SIZE);
-extern "C" void AcpiOsExtUnmapMemory(void *);
+extern "C" void AcpiOsExtUnmapMemory(void *, ACPI_SIZE);  /* Fixed: Added missing size parameter */
 extern "C" ACPI_STATUS AcpiOsExtInitialize(void);
 extern "C" ACPI_PHYSICAL_ADDRESS AcpiOsExtGetRootPointer(void);
 extern "C" ACPI_STATUS AcpiOsExtExecute(ACPI_EXECUTE_TYPE Type, ACPI_OSD_EXEC_CALLBACK Function, void *Context);
+extern "C" void AcpiOsExtWaitEventsComplete(void);
 
 IOWorkLoop *gAcpiOsThreadWorkLoop;
 IOCommandGate *gAcpiOsThreadCommandGate;
@@ -63,9 +65,18 @@ ACPI_MCFG_ALLOCATION gPCIFromPE;
 ACPI_MCFG_ALLOCATION *gPCIDataFromMCFG;
 size_t gPCIMCFGEntryCount;
 
+/* Enhanced PCI access state */
+static boolean_t gPCIEcamAvailable = false;
+static IOMemoryMap *gPCIEcamMap = NULL;
+static void *gPCIEcamVirtualBase = NULL;
+
 IOLock *gAcpiOsExtMemoryMapLock;
 OSSet *gAcpiOsExtMemoryMapSet;
 OSCollectionIterator *gAcpiOsExtMemoryMapIterator;
+
+/* Enhanced execution tracking */
+static UInt32 gPendingExecutions = 0;
+static IOLock *gExecutionLock;
 
 struct _iocmdq_callback_data
 {
@@ -76,13 +87,58 @@ struct _iocmdq_callback_data
 IOReturn AcpiOsThreadDispatch(OSObject *, void *field0, void *, void *, void *)
 {
     _iocmdq_callback_data *d = (_iocmdq_callback_data *)field0;
+    
     ml_set_interrupts_enabled(false); /* disable interrupts */
     d->Callback(d->Context);
     ml_set_interrupts_enabled(true); /* enable interrupts */
 
+    /* Update pending execution count */
+    IOLockLock(gExecutionLock);
+    if (gPendingExecutions > 0) {
+        gPendingExecutions--;
+    }
+    IOLockUnlock(gExecutionLock);
+
     /* we no longer have need for our callback data, and we have exited the cautious period without interrupts. */
     IOFree(d, sizeof(_iocmdq_callback_data));
     return kIOReturnSuccess;
+}
+
+/*
+ * Initialize ECAM/MMIO PCI Configuration Space Access
+ * This sets up memory mapping for the PCI configuration space base
+ * obtained from boot arguments or MCFG table.
+ */
+static ACPI_STATUS InitializePCIEcam(void)
+{
+    if (gPCIEcamAvailable) {
+        return AE_OK;
+    }
+    
+    /* Use boot args data if available */
+    if (gPCIFromPE.Address != 0) {
+        ACPI_SIZE ecam_size = (gPCIFromPE.EndBusNumber - gPCIFromPE.StartBusNumber + 1) * 256 * 4096;
+        
+        IOMemoryDescriptor *desc = IOMemoryDescriptor::withAddressRange(
+            gPCIFromPE.Address, ecam_size, 
+            kIOMemoryDirectionInOut | kIOMemoryMapperNone, 
+            kernel_task
+        );
+        
+        if (desc) {
+            gPCIEcamMap = desc->map();
+            if (gPCIEcamMap) {
+                gPCIEcamVirtualBase = (void *)gPCIEcamMap->getVirtualAddress();
+                gPCIEcamAvailable = true;
+                
+                IOLog("ACPI: ECAM initialized at 0x%llx, buses %d-%d\n", 
+                      gPCIFromPE.Address, gPCIFromPE.StartBusNumber, gPCIFromPE.EndBusNumber);
+            }
+            desc->release();
+        }
+    }
+    
+    return gPCIEcamAvailable ? AE_OK : AE_NOT_FOUND;
 }
 
 ACPI_STATUS AcpiOsExtInitialize(void)
@@ -91,6 +147,10 @@ ACPI_STATUS AcpiOsExtInitialize(void)
     gAcpiOsExtMemoryMapLock = IOLockAlloc();
     gAcpiOsExtMemoryMapSet = OSSet::withCapacity(4); /* OSSet's can expand if need be, right? */
     gAcpiOsExtMemoryMapIterator = OSCollectionIterator::withCollection(gAcpiOsExtMemoryMapSet);
+
+    /* Initialize execution tracking */
+    gExecutionLock = IOLockAlloc();
+    gPendingExecutions = 0;
 
     /* init the execution system */
     gAcpiOsThreadWorkLoop = IOWorkLoop::workLoop();
@@ -103,6 +163,10 @@ ACPI_STATUS AcpiOsExtInitialize(void)
     gPCIFromPE.PciSegment = 0;
     gPCIFromPE.StartBusNumber = args->pciConfigSpaceStartBusNumber;
     gPCIFromPE.EndBusNumber = args->pciConfigSpaceEndBusNumber;
+    
+    /* Initialize ECAM if available */
+    InitializePCIEcam();
+    
     return AE_OK;
 }
 
@@ -116,7 +180,8 @@ void *AcpiOsExtMapMemory(ACPI_PHYSICAL_ADDRESS addr, ACPI_SIZE size)
             IOLockLock(gAcpiOsExtMemoryMapLock);
             gAcpiOsExtMemoryMapSet->setObject(map);
             IOLockUnlock(gAcpiOsExtMemoryMapLock);
-            map->release();
+            /* Don't release the map here - we need it for unmapping */
+            desc->release();
             return (void *)va;
         }
         desc->release();
@@ -133,6 +198,7 @@ void AcpiOsExtUnmapMemory(void *p, ACPI_SIZE size)
     while (IOMemoryMap *map = OSDynamicCast(IOMemoryMap, gAcpiOsExtMemoryMapIterator->getNextObject())) {
         if (map->getVirtualAddress() == va && map->getLength() == size) {
             gAcpiOsExtMemoryMapSet->removeObject(map);
+            map->release(); /* Now we can release it */
             break;
         }
     }
@@ -165,15 +231,17 @@ ACPI_PHYSICAL_ADDRESS AcpiOsExtGetRootPointer(void)
             OSData *d = OSDynamicCast(OSData, reg->getProperty("table"));
             if (d && (d->getLength() <= sizeof(tableAddr))) {
                 bcopy(d->getBytesNoCopy(), &tableAddr, d->getLength());
-                IOMemoryDescriptor *desc = IOMemoryDescriptor::withAddressRange(0, sizeof(tbl), kIODirectionOutIn | kIOMemoryMapperNone, kernel_task);
-                bzero(&tbl, sizeof(tbl));
-                desc->readBytes(0, &tbl, sizeof(tbl));
-                reg->release();
-                desc->release();
-                return (ACPI_PHYSICAL_ADDRESS)tbl.VendorTable;
+                IOMemoryDescriptor *desc = IOMemoryDescriptor::withAddressRange(tableAddr, sizeof(tbl), kIODirectionOutIn | kIOMemoryMapperNone, kernel_task);
+                if (desc) {
+                    bzero(&tbl, sizeof(tbl));
+                    desc->readBytes(0, &tbl, sizeof(tbl));
+                    desc->release();
+                    reg->release();
+                    return (ACPI_PHYSICAL_ADDRESS)tbl.VendorTable;
+                }
             }
+            reg->release();
         }
-        reg->release();
     }
     AcpiOsPrintf("ACPI: No RSDP found.\n");
     return 0;
@@ -182,60 +250,305 @@ ACPI_PHYSICAL_ADDRESS AcpiOsExtGetRootPointer(void)
 ACPI_STATUS AcpiOsExtExecute(ACPI_EXECUTE_TYPE Type, ACPI_OSD_EXEC_CALLBACK Function, void *Context)
 {
     _iocmdq_callback_data *d = (_iocmdq_callback_data *)IOMalloc(sizeof(_iocmdq_callback_data));
+    if (!d) {
+        return AE_NO_MEMORY;
+    }
+    
     d->Callback = Function;
     d->Context = Context;
-    gAcpiOsThreadCommandGate->runAction(&AcpiOsThreadDispatch, d);
-    return AE_OK;
-}
-
-void AcpiOsExtWaitEventsComplete(void)
-{
-    /* How do I check that my IOCommandGate has finished all of it's runAction calls? */
-    return;
-}
-
-ACPI_STATUS AcpiOsReadPCIConfigSpace(ACPI_PCI_ID *PciId, UInt32 Reg, UInt64 *Value, UInt32 Width) {
+    
+    /* Track pending executions */
+    IOLockLock(gExecutionLock);
+    gPendingExecutions++;
+    IOLockUnlock(gExecutionLock);
+    
+    IOReturn result = gAcpiOsThreadCommandGate->runAction(&AcpiOsThreadDispatch, d);
+    
+    /* If execution failed, decrement counter */
+    if (result != kIOReturnSuccess) {
+        IOLockLock(gExecutionLock);
+        if (gPendingExecutions > 0) {
+            gPendingExecutions--;
+        }
+        IOLockUnlock(gExecutionLock);
+        IOFree(d, sizeof(_iocmdq_callback_data));
+        return AE_ERROR;
+    }
+    
     return AE_OK;
 }
 
 /*
- #define AE_ERROR                        EXCEP_ENV (0x0001)
- #define AE_NO_ACPI_TABLES               EXCEP_ENV (0x0002)
- #define AE_NO_NAMESPACE                 EXCEP_ENV (0x0003)
- #define AE_NO_MEMORY                    EXCEP_ENV (0x0004)
- #define AE_NOT_FOUND                    EXCEP_ENV (0x0005)
- #define AE_NOT_EXIST                    EXCEP_ENV (0x0006)
- #define AE_ALREADY_EXISTS               EXCEP_ENV (0x0007)
- #define AE_TYPE                         EXCEP_ENV (0x0008)
- #define AE_NULL_OBJECT                  EXCEP_ENV (0x0009)
- #define AE_NULL_ENTRY                   EXCEP_ENV (0x000A)
- #define AE_BUFFER_OVERFLOW              EXCEP_ENV (0x000B)
- #define AE_STACK_OVERFLOW               EXCEP_ENV (0x000C)
- #define AE_STACK_UNDERFLOW              EXCEP_ENV (0x000D)
- #define AE_NOT_IMPLEMENTED              EXCEP_ENV (0x000E)
- #define AE_SUPPORT                      EXCEP_ENV (0x000F)
- #define AE_LIMIT                        EXCEP_ENV (0x0010)
- #define AE_TIME                         EXCEP_ENV (0x0011)
- #define AE_ACQUIRE_DEADLOCK             EXCEP_ENV (0x0012)
- #define AE_RELEASE_DEADLOCK             EXCEP_ENV (0x0013)
- #define AE_NOT_ACQUIRED                 EXCEP_ENV (0x0014)
- #define AE_ALREADY_ACQUIRED             EXCEP_ENV (0x0015)
- #define AE_NO_HARDWARE_RESPONSE         EXCEP_ENV (0x0016)
- #define AE_NO_GLOBAL_LOCK               EXCEP_ENV (0x0017)
- #define AE_ABORT_METHOD                 EXCEP_ENV (0x0018)
- #define AE_SAME_HANDLER                 EXCEP_ENV (0x0019)
- #define AE_NO_HANDLER                   EXCEP_ENV (0x001A)
- #define AE_OWNER_ID_LIMIT               EXCEP_ENV (0x001B)
- #define AE_NOT_CONFIGURED               EXCEP_ENV (0x001C)
- #define AE_ACCESS                       EXCEP_ENV (0x001D)
- #define AE_IO_ERROR                     EXCEP_ENV (0x001E)
- #define AE_NUMERIC_OVERFLOW             EXCEP_ENV (0x001F)
- #define AE_HEX_OVERFLOW                 EXCEP_ENV (0x0020)
- #define AE_DECIMAL_OVERFLOW             EXCEP_ENV (0x0021)
- #define AE_OCTAL_OVERFLOW               EXCEP_ENV (0x0022)
- #define AE_END_OF_TABLE                 EXCEP_ENV (0x0023)
+ * Wait for all pending ACPI executions to complete
+ * This addresses the previous comment: "How do I check that my IOCommandGate has finished all of it's runAction calls?"
  */
+void AcpiOsExtWaitEventsComplete(void)
+{
+    const int max_wait_ms = 5000; /* Maximum wait time: 5 seconds */
+    const int poll_interval_ms = 10; /* Poll every 10ms */
+    int waited_ms = 0;
+    
+    /* Poll until all executions complete or timeout */
+    while (waited_ms < max_wait_ms) {
+        IOLockLock(gExecutionLock);
+        UInt32 pending = gPendingExecutions;
+        IOLockUnlock(gExecutionLock);
+        
+        if (pending == 0) {
+            break; /* All executions completed */
+        }
+        
+        IOSleep(poll_interval_ms);
+        waited_ms += poll_interval_ms;
+    }
+    
+    if (waited_ms >= max_wait_ms) {
+        IOLockLock(gExecutionLock);
+        UInt32 remaining = gPendingExecutions;
+        IOLockUnlock(gExecutionLock);
+        
+        IOLog("ACPI: Warning - %u executions still pending after %d ms timeout\n", 
+              remaining, max_wait_ms);
+    }
+}
 
-IOReturn AcpiStatus2IOReturn(ACPI_STATUS stat) {
-    return kIOReturnUnsupported;
+/*
+ * Enhanced PCI Configuration Space Access using ECAM/MMIO
+ * This implements the missing AcpiOsReadPCIConfigSpace function
+ */
+ACPI_STATUS AcpiOsReadPCIConfigSpace(ACPI_PCI_ID *PciId, UInt32 Reg, UInt64 *Value, UInt32 Width) 
+{
+    if (!PciId || !Value) {
+        return AE_BAD_PARAMETER;
+    }
+    
+    if (Width != 8 && Width != 16 && Width != 32) {
+        return AE_BAD_PARAMETER;
+    }
+    
+    /* Try ECAM/MMIO first if available */
+    if (gPCIEcamAvailable && gPCIEcamVirtualBase &&
+        PciId->Bus >= gPCIFromPE.StartBusNumber && 
+        PciId->Bus <= gPCIFromPE.EndBusNumber) {
+        
+        /* Calculate ECAM offset: (Bus << 20) + (Device << 15) + (Function << 12) + Register */
+        UInt32 bus_offset = (PciId->Bus - gPCIFromPE.StartBusNumber) << 20;
+        UInt32 device_offset = PciId->Device << 15;
+        UInt32 function_offset = PciId->Function << 12;
+        UInt32 total_offset = bus_offset + device_offset + function_offset + Reg;
+        
+        void *config_addr = (char *)gPCIEcamVirtualBase + total_offset;
+        
+        switch (Width) {
+            case 8:
+                *Value = *(UInt8 *)config_addr;
+                break;
+            case 16:
+                *Value = *(UInt16 *)config_addr;
+                break;
+            case 32:
+                *Value = *(UInt32 *)config_addr;
+                break;
+        }
+        
+        return AE_OK;
+    }
+    
+    /* Fallback: This should call the legacy port I/O method */
+    /* For now, return error - the caller should use AcpiOsReadPciConfiguration from osdarwin.c */
+    return AE_NOT_IMPLEMENTED;
+}
+
+/*
+ * Write PCI Configuration Space using ECAM/MMIO
+ * Companion function to AcpiOsReadPCIConfigSpace
+ */
+ACPI_STATUS AcpiOsWritePCIConfigSpace(ACPI_PCI_ID *PciId, UInt32 Reg, UInt64 Value, UInt32 Width)
+{
+    if (!PciId) {
+        return AE_BAD_PARAMETER;
+    }
+    
+    if (Width != 8 && Width != 16 && Width != 32) {
+        return AE_BAD_PARAMETER;
+    }
+    
+    /* Try ECAM/MMIO first if available */
+    if (gPCIEcamAvailable && gPCIEcamVirtualBase &&
+        PciId->Bus >= gPCIFromPE.StartBusNumber && 
+        PciId->Bus <= gPCIFromPE.EndBusNumber) {
+        
+        /* Calculate ECAM offset */
+        UInt32 bus_offset = (PciId->Bus - gPCIFromPE.StartBusNumber) << 20;
+        UInt32 device_offset = PciId->Device << 15;
+        UInt32 function_offset = PciId->Function << 12;
+        UInt32 total_offset = bus_offset + device_offset + function_offset + Reg;
+        
+        void *config_addr = (char *)gPCIEcamVirtualBase + total_offset;
+        
+        switch (Width) {
+            case 8:
+                *(UInt8 *)config_addr = (UInt8)Value;
+                break;
+            case 16:
+                *(UInt16 *)config_addr = (UInt16)Value;
+                break;
+            case 32:
+                *(UInt32 *)config_addr = (UInt32)Value;
+                break;
+        }
+        
+        return AE_OK;
+    }
+    
+    /* Fallback: This should call the legacy port I/O method */
+    return AE_NOT_IMPLEMENTED;
+}
+
+/*
+ * Complete ACPI Status to IOReturn mapping
+ * This addresses the large comment block with all ACPI error codes
+ */
+IOReturn AcpiStatus2IOReturn(ACPI_STATUS stat) 
+{
+    switch (stat) {
+        case AE_OK:
+            return kIOReturnSuccess;
+            
+        /* Memory related errors */
+        case AE_NO_MEMORY:
+            return kIOReturnNoMemory;
+        case AE_BUFFER_OVERFLOW:
+            return kIOReturnOverrun;
+        case AE_STACK_OVERFLOW:
+        case AE_STACK_UNDERFLOW:
+            return kIOReturnOverrun;
+            
+        /* Parameter errors */
+        case AE_BAD_PARAMETER:
+            return kIOReturnBadArgument;
+        case AE_NULL_OBJECT:
+        case AE_NULL_ENTRY:
+            return kIOReturnBadArgument;
+            
+        /* Resource errors */
+        case AE_NOT_FOUND:
+        case AE_NOT_EXIST:
+            return kIOReturnNotFound;
+        case AE_ALREADY_EXISTS:
+            return kIOReturnExclusiveAccess;
+        case AE_LIMIT:
+            return kIOReturnNoResources;
+        case AE_NO_HARDWARE_RESPONSE:
+            return kIOReturnNoDevice;
+            
+        /* Access and permission errors */
+        case AE_ACCESS:
+            return kIOReturnNotPrivileged;
+        case AE_NOT_ACQUIRED:
+        case AE_RELEASE_DEADLOCK:
+        case AE_ACQUIRE_DEADLOCK:
+            return kIOReturnCannotLock;
+        case AE_ALREADY_ACQUIRED:
+            return kIOReturnExclusiveAccess;
+            
+        /* Timing errors */
+        case AE_TIME:
+            return kIOReturnTimeout;
+            
+        /* Implementation errors */
+        case AE_NOT_IMPLEMENTED:
+        case AE_SUPPORT:
+            return kIOReturnUnsupported;
+        case AE_NOT_CONFIGURED:
+            return kIOReturnNotReady;
+            
+        /* Data errors */
+        case AE_TYPE:
+            return kIOReturnBadMessageID;
+        case AE_NUMERIC_OVERFLOW:
+        case AE_HEX_OVERFLOW:
+        case AE_DECIMAL_OVERFLOW:
+        case AE_OCTAL_OVERFLOW:
+            return kIOReturnMessageTooLarge;
+            
+        /* Table and namespace errors */
+        case AE_NO_ACPI_TABLES:
+        case AE_NO_NAMESPACE:
+            return kIOReturnNotReady;
+        case AE_END_OF_TABLE:
+            return kIOReturnSuccess; /* End of iteration, not an error */
+            
+        /* I/O errors */
+        case AE_IO_ERROR:
+            return kIOReturnIOError;
+            
+        /* Method execution errors */
+        case AE_ABORT_METHOD:
+            return kIOReturnAborted;
+        case AE_NO_GLOBAL_LOCK:
+        case AE_NO_HANDLER:
+        case AE_SAME_HANDLER:
+            return kIOReturnNoResources;
+        case AE_OWNER_ID_LIMIT:
+            return kIOReturnNoResources;
+            
+        /* Generic errors */
+        case AE_ERROR:
+        default:
+            return kIOReturnError;
+    }
+}
+
+/*
+ * Cleanup function for AcpiOsLayer resources
+ * Should be called during termination
+ */
+ACPI_STATUS AcpiOsExtTerminate(void)
+{
+    /* Wait for all pending executions to complete */
+    AcpiOsExtWaitEventsComplete();
+    
+    /* Cleanup ECAM mapping */
+    if (gPCIEcamMap) {
+        gPCIEcamMap->release();
+        gPCIEcamMap = NULL;
+        gPCIEcamVirtualBase = NULL;
+        gPCIEcamAvailable = false;
+    }
+    
+    /* Cleanup work loop and command gate */
+    if (gAcpiOsThreadCommandGate) {
+        gAcpiOsThreadCommandGate->release();
+        gAcpiOsThreadCommandGate = NULL;
+    }
+    
+    if (gAcpiOsThreadWorkLoop) {
+        gAcpiOsThreadWorkLoop->release();
+        gAcpiOsThreadWorkLoop = NULL;
+    }
+    
+    /* Cleanup memory maps */
+    if (gAcpiOsExtMemoryMapIterator) {
+        gAcpiOsExtMemoryMapIterator->release();
+        gAcpiOsExtMemoryMapIterator = NULL;
+    }
+    
+    if (gAcpiOsExtMemoryMapSet) {
+        gAcpiOsExtMemoryMapSet->release();
+        gAcpiOsExtMemoryMapSet = NULL;
+    }
+    
+    /* Cleanup locks */
+    if (gAcpiOsExtMemoryMapLock) {
+        IOLockFree(gAcpiOsExtMemoryMapLock);
+        gAcpiOsExtMemoryMapLock = NULL;
+    }
+    
+    if (gExecutionLock) {
+        IOLockFree(gExecutionLock);
+        gExecutionLock = NULL;
+    }
+    
+    return AE_OK;
 }
